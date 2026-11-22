@@ -1635,6 +1635,31 @@ func CreateBranch(t translations.TranslationHelperFunc) inventory.ServerTool {
 	)
 }
 
+// rollbackCreatedBranch deletes a branch this call created, but only while it
+// still points at ourSHA, the commit this call last set. Another actor may have
+// moved the branch during the failed push. It returns a note when the branch is
+// left in place or the delete fails; an empty string means it was removed.
+func rollbackCreatedBranch(ctx context.Context, client *github.Client, owner, repo, branch, ourSHA string) string {
+	ctx = context.WithoutCancel(ctx)
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return fmt.Sprintf("rollback: branch %q left in place; could not verify its state: %v", branch, err)
+	}
+	if current := ref.GetObject().GetSHA(); current != ourSHA {
+		return fmt.Sprintf("rollback: branch %q left in place because it now points at %s, not %s", branch, current, ourSHA)
+	}
+	if resp, err := client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch); err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return fmt.Sprintf("rollback: failed to delete branch %q: %v", branch, err)
+	}
+	return ""
+}
+
 // PushFiles creates a tool to push multiple files in a single commit to a GitHub repository.
 func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 	tool := NewTool[PushFilesInput, *RepositoryReferenceOutput](
@@ -1689,7 +1714,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			},
 		},
 		publicRepositoryWriteScopeAccess(),
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, input PushFilesInput) (*mcp.CallToolResult, *RepositoryReferenceOutput, error) {
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, input PushFilesInput) (toolResult *mcp.CallToolResult, out *RepositoryReferenceOutput, retErr error) {
 			owner := input.Owner
 			if owner == "" {
 				return utils.NewToolResultError("missing required parameter: owner"), nil, nil
@@ -1765,11 +1790,14 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			}
 
 			var createdBranch, branchPublished bool
+			var ourSHA string
 			defer func() {
 				// The branch was created by this call. If any later step fails,
 				// delete it so a retry does not hit an orphan branch.
 				if createdBranch && !branchPublished {
-					_, _ = client.Git.DeleteRef(context.WithoutCancel(ctx), owner, repo, "heads/"+branch)
+					if note := rollbackCreatedBranch(ctx, client, owner, repo, branch, ourSHA); note != "" && toolResult != nil {
+						toolResult.Content = append(toolResult.Content, &mcp.TextContent{Text: note})
+					}
 				}
 			}()
 			var baseCommit *github.Commit
@@ -1780,6 +1808,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
 					createdBranch = true
+					ourSHA = *ref.Object.SHA
 				}
 
 				// Get the commit object that the branch points to
@@ -1810,6 +1839,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
 					createdBranch = true
+					ourSHA = *ref.Object.SHA
 				}
 
 				baseCommit = base
@@ -1848,6 +1878,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 
 			// Update the reference to point to the new commit
 			ref.Object.SHA = newCommit.SHA
+			ourSHA = *newCommit.SHA
 			updatedRef, resp, err := client.Git.UpdateRef(ctx, owner, repo, *ref.Ref, github.UpdateRef{
 				SHA:   *newCommit.SHA,
 				Force: new(false),
