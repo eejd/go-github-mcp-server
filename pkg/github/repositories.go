@@ -1764,6 +1764,14 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 				defer func() { _ = resp.Body.Close() }()
 			}
 
+			var createdBranch, branchPublished bool
+			defer func() {
+				// The branch was created by this call. If any later step fails,
+				// delete it so a retry does not hit an orphan branch.
+				if createdBranch && !branchPublished {
+					_, _ = client.Git.DeleteRef(context.WithoutCancel(ctx), owner, repo, "heads/"+branch)
+				}
+			}()
 			var baseCommit *github.Commit
 			if !repositoryIsEmpty {
 				if branchNotFound {
@@ -1771,6 +1779,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					if err != nil {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
+					createdBranch = true
 				}
 
 				// Get the commit object that the branch points to
@@ -1800,6 +1809,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					if err != nil {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
+					createdBranch = true
 				}
 
 				baseCommit = base
@@ -1849,6 +1859,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					err,
 				), nil, nil
 			}
+			branchPublished = true
 			defer func() { _ = resp.Body.Close() }()
 
 			r, err := json.Marshal(updatedRef)
