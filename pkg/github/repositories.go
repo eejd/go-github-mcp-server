@@ -1636,10 +1636,14 @@ func CreateBranch(t translations.TranslationHelperFunc) inventory.ServerTool {
 }
 
 // rollbackCreatedBranch deletes a branch this call created, but only while it
-// still points at ourSHA, the commit this call last set. Another actor may have
-// moved the branch during the failed push. It returns a note when the branch is
-// left in place or the delete fails; an empty string means it was removed.
-func rollbackCreatedBranch(ctx context.Context, client *github.Client, owner, repo, branch, ourSHA string) string {
+// still points at one of ownedSHAs: the SHA the branch was created at, or the
+// commit this call last set. Another actor may have moved the branch to any
+// other commit during the failed push, which is then left in place and
+// reported. GitHub has no compare-and-delete, so a narrow window remains
+// between this GetRef and DeleteRef; that race is accepted and documented.
+// It returns a note when the branch is left in place or the delete fails; an
+// empty string means it was removed.
+func rollbackCreatedBranch(ctx context.Context, client *github.Client, owner, repo, branch string, ownedSHAs ...string) string {
 	ctx = context.WithoutCancel(ctx)
 	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
 	if resp != nil && resp.Body != nil {
@@ -1648,8 +1652,9 @@ func rollbackCreatedBranch(ctx context.Context, client *github.Client, owner, re
 	if err != nil {
 		return fmt.Sprintf("rollback: branch %q left in place; could not verify its state: %v", branch, err)
 	}
-	if current := ref.GetObject().GetSHA(); current != ourSHA {
-		return fmt.Sprintf("rollback: branch %q left in place because it now points at %s, not %s", branch, current, ourSHA)
+	current := ref.GetObject().GetSHA()
+	if !slices.Contains(ownedSHAs, current) {
+		return fmt.Sprintf("rollback: branch %q left in place because it now points at %s, not one of ours", branch, current)
 	}
 	if resp, err := client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch); err != nil {
 		if resp != nil && resp.Body != nil {
@@ -1790,12 +1795,12 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			}
 
 			var createdBranch, branchPublished bool
-			var ourSHA string
+			var createdAtSHA, ourSHA string
 			defer func() {
 				// The branch was created by this call. If any later step fails,
 				// delete it so a retry does not hit an orphan branch.
 				if createdBranch && !branchPublished {
-					if note := rollbackCreatedBranch(ctx, client, owner, repo, branch, ourSHA); note != "" && toolResult != nil {
+					if note := rollbackCreatedBranch(ctx, client, owner, repo, branch, createdAtSHA, ourSHA); note != "" && toolResult != nil {
 						toolResult.Content = append(toolResult.Content, &mcp.TextContent{Text: note})
 					}
 				}
@@ -1808,7 +1813,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
 					createdBranch = true
-					ourSHA = *ref.Object.SHA
+					createdAtSHA = *ref.Object.SHA
 				}
 
 				// Get the commit object that the branch points to
@@ -1839,7 +1844,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 						return utils.NewToolResultError(fmt.Sprintf("failed to create branch from default: %v", err)), nil, nil
 					}
 					createdBranch = true
-					ourSHA = *ref.Object.SHA
+					createdAtSHA = *ref.Object.SHA
 				}
 
 				baseCommit = base
