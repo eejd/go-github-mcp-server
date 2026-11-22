@@ -6877,3 +6877,186 @@ func Test_ListRepositoryCollaborators(t *testing.T) {
 		})
 	}
 }
+
+// pushFilesRollbackRun runs PushFiles with a failing tree creation so the rollback
+// path executes. featureGets answers successive GET heads/feature calls; the last
+// one repeats. It returns the DELETE count and the tool result.
+func pushFilesRollbackRun(t *testing.T, repoEmpty bool, featureGets []http.HandlerFunc, deleteStatus int) (int, *mcp.CallToolResult) {
+	t.Helper()
+	return pushFilesRollbackRunOpts(t, repoEmpty, featureGets, deleteStatus, 0)
+}
+
+// pushFilesRollbackRunOpts runs PushFiles through the rollback path. updateStatus 0
+// fails tree creation; any other value lets tree and commit succeed and fails the
+// ref update with that status, so the branch keeps its creation SHA.
+func pushFilesRollbackRunOpts(t *testing.T, repoEmpty bool, featureGets []http.HandlerFunc, deleteStatus, updateStatus int) (int, *mcp.CallToolResult) {
+	t.Helper()
+	treeHandler := mockResponse(t, http.StatusInternalServerError, nil)
+	if updateStatus != 0 {
+		treeHandler = mockResponse(t, http.StatusCreated, &github.Tree{SHA: new("tree123")})
+	}
+
+	mockSourceRef := &github.Reference{
+		Ref:    new("refs/heads/main"),
+		Object: &github.GitObject{SHA: new("base123")},
+	}
+	mockCommit := &github.Commit{
+		SHA:  new("base123"),
+		Tree: &github.Tree{SHA: new("tree123")},
+	}
+
+	featureCalls := 0
+	deleteCalls := 0
+	handlers := []MockBackendOption{
+		WithRequestMatchHandler("GET /repos/owner/repo",
+			mockResponse(t, http.StatusOK, &github.Repository{DefaultBranch: new("main")})),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/ref/heads/feature",
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := min(featureCalls, len(featureGets)-1)
+				featureCalls++
+				featureGets[i](w, r)
+			})),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/ref/heads/main",
+			mockResponse(t, http.StatusOK, mockSourceRef)),
+		WithRequestMatchHandler("POST /repos/owner/repo/git/refs",
+			mockResponse(t, http.StatusCreated, mockSourceRef)),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/commits/base123",
+			mockResponse(t, http.StatusOK, mockCommit)),
+		WithRequestMatchHandler("POST /repos/owner/repo/git/trees", treeHandler),
+		WithRequestMatchHandler("DELETE /repos/owner/repo/git/refs/{ref:.*}",
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				deleteCalls++
+				if deleteStatus != http.StatusNoContent {
+					w.WriteHeader(deleteStatus)
+					_, _ = w.Write([]byte(`{"message":"delete refused"}`))
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})),
+	}
+	if repoEmpty {
+		handlers = append(handlers,
+			WithRequestMatchHandler("PUT /repos/owner/repo/contents/README.md",
+				mockResponse(t, http.StatusCreated, &github.RepositoryContentResponse{
+					Commit: github.Commit{SHA: new("init123")},
+				})),
+			WithRequestMatchHandler("GET /repos/owner/repo/git/commits/init123",
+				mockResponse(t, http.StatusOK, mockCommit)),
+		)
+	}
+
+	if updateStatus != 0 {
+		handlers = append(handlers,
+			WithRequestMatchHandler("POST /repos/owner/repo/git/commits",
+				mockResponse(t, http.StatusCreated, &github.Commit{SHA: new("new456"), Tree: &github.Tree{SHA: new("tree123")}})),
+			WithRequestMatchHandler("PATCH /repos/owner/repo/git/refs/{ref:.*}",
+				mockResponse(t, updateStatus, map[string]string{"message": "Reference update failed"})),
+		)
+	}
+	deps := BaseDeps{Client: mustNewGHClient(t, NewMockedHTTPClient(handlers...))}
+	request := createMCPRequest(map[string]any{
+		"owner":   "owner",
+		"repo":    "repo",
+		"branch":  "feature",
+		"files":   []any{map[string]any{"path": "README.md", "content": "# README"}},
+		"message": "Update file",
+	})
+
+	serverTool := PushFiles(translations.NullTranslationHelper)
+	handler := serverTool.Handler(deps)
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	return deleteCalls, result
+}
+
+func pushFilesRefBody(t *testing.T, sha string) http.HandlerFunc {
+	t.Helper()
+	return mockResponse(t, http.StatusOK, &github.Reference{
+		Ref:    new("refs/heads/feature"),
+		Object: &github.GitObject{SHA: new(sha)},
+	})
+}
+
+func pushFilesNotFound(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return mockResponse(t, http.StatusNotFound, map[string]string{"message": "Not Found"})
+}
+
+func pushFilesText(result *mcp.CallToolResult) string {
+	var sb strings.Builder
+	for _, c := range result.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			sb.WriteString(tc.Text)
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
+}
+
+// Test_PushFiles_DeletesCreatedBranchOnFailure covers #3755: a branch created by
+// PushFiles is removed after a later failure, only while it still points at the
+// SHA this call set, and rollback failures are reported.
+func Test_PushFiles_DeletesCreatedBranchOnFailure(t *testing.T) {
+	t.Run("created branch still at our SHA is deleted", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRun(t, false,
+			[]http.HandlerFunc{pushFilesNotFound(t), pushFilesRefBody(t, "base123")},
+			http.StatusNoContent)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 1, deletes, "created branch must be deleted after a failed push")
+	})
+
+	t.Run("(e) UpdateRef failure after branch creation deletes the created branch once", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRunOpts(t, false,
+			[]http.HandlerFunc{pushFilesNotFound(t), pushFilesRefBody(t, "base123")},
+			http.StatusNoContent, http.StatusUnprocessableEntity)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 1, deletes, "branch still at its creation SHA must be deleted")
+	})
+
+	t.Run("(f) ref moved to a third SHA after failed update is left in place", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRunOpts(t, false,
+			[]http.HandlerFunc{pushFilesNotFound(t), pushFilesRefBody(t, "other999")},
+			http.StatusNoContent, http.StatusUnprocessableEntity)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 0, deletes, "a branch moved to a third SHA must not be deleted")
+		assert.Contains(t, pushFilesText(result), "left in place")
+	})
+
+	t.Run("pre-existing branch is never deleted", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRun(t, false,
+			[]http.HandlerFunc{pushFilesRefBody(t, "base123")},
+			http.StatusNoContent)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 0, deletes, "a branch this call did not create must not be deleted")
+	})
+
+	t.Run("empty repository created branch is deleted", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRun(t, true,
+			[]http.HandlerFunc{
+				mockResponse(t, http.StatusConflict, map[string]string{"message": "Git Repository is empty."}),
+				pushFilesRefBody(t, "base123"),
+			},
+			http.StatusNoContent)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 1, deletes, "branch created in an empty repository must be rolled back")
+	})
+
+	t.Run("branch moved by another actor is left in place", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRun(t, false,
+			[]http.HandlerFunc{pushFilesNotFound(t), pushFilesRefBody(t, "someoneelse999")},
+			http.StatusNoContent)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 0, deletes, "a branch moved by another actor must not be deleted")
+		assert.Contains(t, pushFilesText(result), "left in place")
+	})
+
+	t.Run("failing rollback delete is reported", func(t *testing.T) {
+		deletes, result := pushFilesRollbackRun(t, false,
+			[]http.HandlerFunc{pushFilesNotFound(t), pushFilesRefBody(t, "base123")},
+			http.StatusInternalServerError)
+		assert.True(t, result.IsError)
+		assert.Equal(t, 1, deletes)
+		assert.Contains(t, pushFilesText(result), "rollback: failed to delete")
+	})
+}
