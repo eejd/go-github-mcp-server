@@ -115,6 +115,14 @@ var (
 				}
 			}
 
+			readOnly, err := parseStrictBool("read-only")
+			if err != nil {
+				return err
+			}
+			lockdownMode, err := parseStrictBool("lockdown-mode")
+			if err != nil {
+				return err
+			}
 			ttl := viper.GetDuration("repo-access-cache-ttl")
 			stdioServerConfig := ghmcp.StdioServerConfig{
 				Version:              serverVersion,
@@ -123,12 +131,12 @@ var (
 				EnabledToolsets:      enabledToolsets,
 				EnabledTools:         enabledTools,
 				EnabledFeatures:      enabledFeatures,
-				ReadOnly:             viper.GetBool("read-only"),
+				ReadOnly:             readOnly,
 				ExportTranslations:   viper.GetBool("export-translations"),
 				EnableCommandLogging: viper.GetBool("enable-command-logging"),
 				LogFilePath:          viper.GetString("log-file"),
 				ContentWindowSize:    viper.GetInt("content-window-size"),
-				LockdownMode:         viper.GetBool("lockdown-mode"),
+				LockdownMode:         lockdownMode,
 				InsidersMode:         viper.GetBool("insiders"),
 				ExcludeTools:         excludeTools,
 				RepoAccessCacheTTL:   &ttl,
@@ -202,6 +210,14 @@ var (
 				}
 			}
 
+			readOnly, err := parseStrictBool("read-only")
+			if err != nil {
+				return err
+			}
+			lockdownMode, err := parseStrictBool("lockdown-mode")
+			if err != nil {
+				return err
+			}
 			ttl := viper.GetDuration("repo-access-cache-ttl")
 			httpConfig := ghhttp.ServerConfig{
 				Version:              version,
@@ -215,10 +231,10 @@ var (
 				EnableCommandLogging: viper.GetBool("enable-command-logging"),
 				LogFilePath:          viper.GetString("log-file"),
 				ContentWindowSize:    viper.GetInt("content-window-size"),
-				LockdownMode:         viper.GetBool("lockdown-mode"),
+				LockdownMode:         lockdownMode,
 				RepoAccessCacheTTL:   &ttl,
 				ScopeChallenge:       viper.GetBool("scope-challenge"),
-				ReadOnly:             viper.GetBool("read-only"),
+				ReadOnly:             readOnly,
 				EnabledToolsets:      enabledToolsets,
 				EnabledTools:         enabledTools,
 				ExcludeTools:         excludeTools,
@@ -372,4 +388,19 @@ func wordSepNormalizeFunc(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 		name = strings.ReplaceAll(name, sep, to)
 	}
 	return pflag.NormalizedName(name)
+}
+
+// parseStrictBool reads a boolean setting from viper and fails on unrecognized
+// values. viper.GetBool silently treats values like "yes" as false, which would
+// disable read-only mode without any warning.
+func parseStrictBool(key string) (bool, error) {
+	raw := strings.TrimSpace(strings.ToLower(viper.GetString(key)))
+	switch raw {
+	case "", "false", "0", "no", "n", "off", "f":
+		return false, nil
+	case "true", "1", "yes", "y", "on", "t":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value %q for %s", viper.GetString(key), key)
+	}
 }

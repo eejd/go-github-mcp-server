@@ -93,3 +93,36 @@ func TestSchemaTypeString(t *testing.T) {
 		})
 	}
 }
+
+func TestParseStrictBool(t *testing.T) {
+	cases := []struct {
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{"yes", true, false},
+		{"YES", true, false},
+		{"on", true, false},
+		{"true", true, false},
+		{"no", false, false},
+		{"off", false, false},
+		{"", false, false},
+		{"maybe", false, true},
+		{"tru", false, true},
+	}
+	for _, key := range []string{"read-only", "lockdown-mode"} {
+		for _, tc := range cases {
+			t.Run(key+"/"+tc.value, func(t *testing.T) {
+				viper.Reset()
+				viper.Set(key, tc.value)
+				got, err := parseStrictBool(key)
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+				}
+				if got != tc.want {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			})
+		}
+	}
+}
