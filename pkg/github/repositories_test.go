@@ -6877,3 +6877,54 @@ func Test_ListRepositoryCollaborators(t *testing.T) {
 		})
 	}
 }
+
+// Test_PushFiles_DeletesCreatedBranchOnFailure covers #3755: a branch created
+// by PushFiles must be removed when a later step fails before publication.
+func Test_PushFiles_DeletesCreatedBranchOnFailure(t *testing.T) {
+	serverTool := PushFiles(translations.NullTranslationHelper)
+
+	mockSourceRef := &github.Reference{
+		Ref:    new("refs/heads/main"),
+		Object: &github.GitObject{SHA: new("base123")},
+	}
+	mockCommit := &github.Commit{
+		SHA:  new("base123"),
+		Tree: &github.Tree{SHA: new("tree123")},
+	}
+
+	deleteCalls := 0
+	client := NewMockedHTTPClient(
+		WithRequestMatchHandler("GET /repos/owner/repo",
+			mockResponse(t, http.StatusOK, &github.Repository{DefaultBranch: new("main")})),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/ref/heads/feature",
+			mockResponse(t, http.StatusNotFound, map[string]string{"message": "Not Found"})),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/ref/heads/main",
+			mockResponse(t, http.StatusOK, mockSourceRef)),
+		WithRequestMatchHandler("POST /repos/owner/repo/git/refs",
+			mockResponse(t, http.StatusCreated, mockSourceRef)),
+		WithRequestMatchHandler("GET /repos/owner/repo/git/commits/base123",
+			mockResponse(t, http.StatusOK, mockCommit)),
+		WithRequestMatchHandler("POST /repos/owner/repo/git/trees",
+			mockResponse(t, http.StatusInternalServerError, nil)),
+		WithRequestMatchHandler("DELETE /repos/owner/repo/git/refs/{ref:.*}",
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				deleteCalls++
+				w.WriteHeader(http.StatusNoContent)
+			})),
+	)
+
+	deps := BaseDeps{Client: mustNewGHClient(t, client)}
+	handler := serverTool.Handler(deps)
+	request := createMCPRequest(map[string]any{
+		"owner":   "owner",
+		"repo":    "repo",
+		"branch":  "feature",
+		"files":   []any{map[string]any{"path": "README.md", "content": "# README"}},
+		"message": "Update file",
+	})
+
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	assert.Equal(t, 1, deleteCalls, "created branch must be deleted after a failed push")
+}
