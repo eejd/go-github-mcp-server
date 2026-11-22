@@ -870,6 +870,10 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create pull request", resp, bodyBytes), nil, nil
 			}
 
+			// The pull request already exists at this point. A reviewer-request
+			// failure must not be reported as a failed creation, or callers retry
+			// and create duplicate pull requests. Report it as a warning instead.
+			var reviewerWarning string
 			if len(reviewers) > 0 {
 				userReviewers, teamReviewers := splitPullRequestReviewers(reviewers)
 				reviewersRequest := github.ReviewersRequest{
@@ -878,25 +882,13 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				}
 
 				_, reviewerResp, err := client.PullRequests.RequestReviewers(ctx, owner, repo, pr.GetNumber(), reviewersRequest)
-				if err != nil {
-					return ghErrors.NewGitHubAPIErrorResponse(ctx,
-						"failed to request reviewers",
-						reviewerResp,
-						err,
-					), nil, nil
+				if reviewerResp != nil && reviewerResp.Body != nil {
+					_ = reviewerResp.Body.Close()
 				}
-				defer func() {
-					if reviewerResp != nil && reviewerResp.Body != nil {
-						_ = reviewerResp.Body.Close()
-					}
-				}()
-
-				if reviewerResp.StatusCode != http.StatusCreated && reviewerResp.StatusCode != http.StatusOK {
-					bodyBytes, err := io.ReadAll(reviewerResp.Body)
-					if err != nil {
-						return utils.NewToolResultErrorFromErr("failed to read response body", err), nil, nil
-					}
-					return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to request reviewers", reviewerResp, bodyBytes), nil, nil
+				if err != nil {
+					reviewerWarning = fmt.Sprintf("pull request created but failed to request reviewers: %v", err)
+				} else if reviewerResp.StatusCode != http.StatusCreated && reviewerResp.StatusCode != http.StatusOK {
+					reviewerWarning = fmt.Sprintf("pull request created but failed to request reviewers: HTTP %d", reviewerResp.StatusCode)
 				}
 			}
 
@@ -906,7 +898,15 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				URL: pr.GetHTMLURL(),
 			}
 
-			r, err := json.Marshal(minimalResponse)
+			var r []byte
+			if reviewerWarning == "" {
+				r, err = json.Marshal(minimalResponse)
+			} else {
+				r, err = json.Marshal(struct {
+					MinimalResponse
+					Warning string `json:"warning"`
+				}{minimalResponse, reviewerWarning})
+			}
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
 			}
@@ -1173,6 +1173,7 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 			}
 
 			// Handle reviewer requests
+			var reviewerWarning string
 			if len(reviewers) > 0 {
 				client, err := deps.GetClient(ctx)
 				if err != nil {
@@ -1186,25 +1187,13 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				}
 
 				_, resp, err := client.PullRequests.RequestReviewers(ctx, owner, repo, pullNumber, reviewersRequest)
-				if err != nil {
-					return ghErrors.NewGitHubAPIErrorResponse(ctx,
-						"failed to request reviewers",
-						resp,
-						err,
-					), nil, nil
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
 				}
-				defer func() {
-					if resp != nil && resp.Body != nil {
-						_ = resp.Body.Close()
-					}
-				}()
-
-				if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-					bodyBytes, err := io.ReadAll(resp.Body)
-					if err != nil {
-						return utils.NewToolResultErrorFromErr("failed to read response body", err), nil, nil
-					}
-					return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to request reviewers", resp, bodyBytes), nil, nil
+				if err != nil {
+					reviewerWarning = fmt.Sprintf("pull request updated but failed to request reviewers: %v", err)
+				} else if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+					reviewerWarning = fmt.Sprintf("pull request updated but failed to request reviewers: HTTP %d", resp.StatusCode)
 				}
 			}
 
@@ -1230,7 +1219,15 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				URL: finalPR.GetHTMLURL(),
 			}
 
-			r, err := json.Marshal(minimalResponse)
+			var r []byte
+			if reviewerWarning == "" {
+				r, err = json.Marshal(minimalResponse)
+			} else {
+				r, err = json.Marshal(struct {
+					MinimalResponse
+					Warning string `json:"warning"`
+				}{minimalResponse, reviewerWarning})
+			}
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("Failed to marshal response", err), nil, nil
 			}

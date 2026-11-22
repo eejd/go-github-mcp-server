@@ -367,23 +367,6 @@ func Test_UpdatePullRequest(t *testing.T) {
 			expectError:    true,
 			expectedErrMsg: "failed to update pull request",
 		},
-		{
-			name: "request reviewers fails",
-			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
-				PostReposPullsRequestedReviewersByOwnerByRepoByPullNumber: func(w http.ResponseWriter, _ *http.Request) {
-					w.WriteHeader(http.StatusUnprocessableEntity)
-					_, _ = w.Write([]byte(`{"message": "Invalid reviewers"}`))
-				},
-			}),
-			requestArgs: map[string]any{
-				"owner":      "owner",
-				"repo":       "repo",
-				"pullNumber": float64(42),
-				"reviewers":  []any{"invalid-user"},
-			},
-			expectError:    true,
-			expectedErrMsg: "failed to request reviewers",
-		},
 	}
 
 	for _, tc := range tests {
@@ -5025,4 +5008,71 @@ func TestResolveReviewThread(t *testing.T) {
 			assert.Equal(t, tc.expectedResult, textContent.Text)
 		})
 	}
+}
+
+// reviewerFailureClient fails the requested_reviewers call (#3756) while the
+// PR create/update call itself succeeds.
+func reviewerFailureClient(t *testing.T, prMethodPath EndpointPattern, prStatus int) *http.Client {
+	t.Helper()
+	return NewMockedHTTPClient(
+		WithRequestMatchHandler("GET /repos/owner/repo/pulls/42",
+			mockResponse(t, http.StatusOK, &github.PullRequest{Number: new(42), Title: new("Test PR"), State: new("open"), HTMLURL: new("https://github.com/owner/repo/pull/42"), Head: &github.PullRequestBranch{SHA: new("abcd1234"), Ref: new("feature")}, Base: &github.PullRequestBranch{SHA: new("efgh5678"), Ref: new("main")}})),
+		WithRequestMatchHandler(prMethodPath,
+			mockResponse(t, prStatus, &github.PullRequest{
+				Number:  new(42),
+				Title:   new("Test PR"),
+				State:   new("open"),
+				HTMLURL: new("https://github.com/owner/repo/pull/42"),
+				Head:    &github.PullRequestBranch{SHA: new("abcd1234"), Ref: new("feature")},
+				Base:    &github.PullRequestBranch{SHA: new("efgh5678"), Ref: new("main")},
+			})),
+		WithRequestMatchHandler("POST /repos/owner/repo/pulls/42/requested_reviewers",
+			mockResponse(t, http.StatusUnprocessableEntity, map[string]string{"message": "Review cannot be requested from pull request author."})),
+	)
+}
+
+// Test_CreatePullRequest_ReviewerFailureReturnsWarning covers #3756 (create path).
+func Test_CreatePullRequest_ReviewerFailureReturnsWarning(t *testing.T) {
+	serverTool := CreatePullRequest(translations.NullTranslationHelper)
+	client := reviewerFailureClient(t, "POST /repos/owner/repo/pulls", http.StatusCreated)
+	deps := BaseDeps{Client: mustNewGHClient(t, client)}
+	request := createMCPRequest(map[string]any{
+		"owner": "owner", "repo": "repo", "title": "Test PR",
+		"head": "feature", "base": "main", "reviewers": []any{"someone"},
+	})
+
+	result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "PR creation succeeded; reviewer failure must not be an error")
+
+	var body struct {
+		URL     string `json:"url"`
+		Warning string `json:"warning"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &body))
+	assert.Contains(t, body.URL, "pull")
+	assert.Contains(t, body.Warning, "failed to request reviewers")
+}
+
+// Test_UpdatePullRequest_ReviewerFailureReturnsWarning covers #3756 (update path).
+func Test_UpdatePullRequest_ReviewerFailureReturnsWarning(t *testing.T) {
+	serverTool := UpdatePullRequest(translations.NullTranslationHelper)
+	client := reviewerFailureClient(t, "PATCH /repos/owner/repo/pulls/42", http.StatusOK)
+	deps := BaseDeps{Client: mustNewGHClient(t, client)}
+	request := createMCPRequest(map[string]any{
+		"owner": "owner", "repo": "repo", "pullNumber": float64(42),
+		"title": "Updated", "reviewers": []any{"someone"},
+	})
+
+	result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "PR update succeeded; reviewer failure must not be an error")
+
+	var body struct {
+		URL     string `json:"url"`
+		Warning string `json:"warning"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &body))
+	assert.Contains(t, body.URL, "pull")
+	assert.Contains(t, body.Warning, "failed to request reviewers")
 }
